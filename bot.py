@@ -566,8 +566,7 @@ async def predictions_status(message: Message):
 async def admin_cmd(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer(
-            f"⛔ Нет доступа.
-Твой Telegram ID: <code>{message.from_user.id}</code>",
+            f"⛔ Нет доступа.\nТвой Telegram ID: <code>{message.from_user.id}</code>",
             parse_mode="HTML"
         )
         return
