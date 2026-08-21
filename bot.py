@@ -23,6 +23,8 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 
+RICKROLL_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
 
 @dataclass(frozen=True)
 class MatchDef:
@@ -403,6 +405,87 @@ async def notify_all(bot: Bot, mid: str, winner: str):
             pass
 
 
+
+def admin_matches_text() -> str:
+    out = ["🛠 <b>РЕАЛЬНЫЕ РЕЗУЛЬТАТЫ</b>"]
+
+    for title, mids in [
+        ("🔼 Верхняя сетка", ["UB1","UB2","UB3","UB4","UB5","UB6","UB7"]),
+        ("🔽 Нижняя сетка", ["LB1","LB2","LB3","LB4","LB5","LB6"]),
+        ("🏆 Финал", ["GF"]),
+    ]:
+        out.append(f"\n<b>{title}</b>")
+        for mid in mids:
+            actual = get_actual(mid)
+            a, b = resolved_actual_match(mid)
+            if actual:
+                out.append(f"✅ <b>{mid}</b> — {esc(actual[0])}")
+            elif a and b:
+                out.append(f"🎯 <b>{mid}</b> — {esc(a)} vs {esc(b)}")
+            else:
+                out.append(f"🔒 <b>{mid}</b> — ждёт предыдущих матчей")
+    return "\n".join(out)
+
+
+def admin_matches_keyboard():
+    rows = []
+    for mid in ORDER:
+        if get_actual(mid):
+            continue
+        a, b = resolved_actual_match(mid)
+        if a and b:
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"🎯 {mid}: {a} vs {b}",
+                    callback_data=f"adminmatch:{mid}"
+                )
+            ])
+
+    rows.append([
+        InlineKeyboardButton(text="🏆 Общий счёт", callback_data="admin:leaderboard"),
+        InlineKeyboardButton(text="📋 Обновить", callback_data="admin:matches")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def notify_winners(bot: Bot):
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("SELECT user_id, username, first_name FROM users")
+            users = cur.fetchall()
+
+    results = []
+    for uid, username, first_name in users:
+        if not prediction_complete(uid):
+            continue
+        correct, completed, _ = score(uid)
+        results.append((uid, correct, completed))
+
+    if not results:
+        return
+
+    best_score = max(correct for _, correct, _ in results)
+    winners = [(uid, completed) for uid, correct, completed in results if correct == best_score]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎁 ЗАБРАТЬ АРКАНУ", url=RICKROLL_URL)
+    ]])
+
+    for uid, completed in winners:
+        try:
+            await bot.send_message(
+                uid,
+                "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\n"
+                "Вы самый лучший прогнозёр The International!\n"
+                f"Ваш результат: <b>{best_score}/{completed}</b>\n\n"
+                "🎁 Вы выиграли <b>Аркану</b>!\n"
+                "Нажмите кнопку ниже, чтобы получить приз:",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+        except Exception:
+            pass
+
 dp = Dispatcher()
 
 
@@ -416,7 +499,7 @@ async def start(message: Message):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🎯 Мой счёт", callback_data="user:score"),
-                InlineKeyboardButton(text="🏅 Рейтинг", callback_data="user:leaderboard")
+                InlineKeyboardButton(text="🏆 Общий счёт", callback_data="user:leaderboard")
             ]])
         )
         return
@@ -425,7 +508,7 @@ async def start(message: Message):
         [InlineKeyboardButton(text="🔥 ЗАПОЛНИТЬ ПРОГНОЗ", callback_data="user:start")],
         [
             InlineKeyboardButton(text="🎯 Мой счёт", callback_data="user:score"),
-            InlineKeyboardButton(text="🏅 Рейтинг", callback_data="user:leaderboard"),
+            InlineKeyboardButton(text="🏆 Общий счёт", callback_data="user:leaderboard"),
         ]
     ])
     await message.answer(
@@ -483,19 +566,17 @@ async def predictions_status(message: Message):
 async def admin_cmd(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer(
-            f"⛔ Нет доступа.\nТвой Telegram ID: <code>{message.from_user.id}</code>",
+            f"⛔ Нет доступа.
+Твой Telegram ID: <code>{message.from_user.id}</code>",
             parse_mode="HTML"
         )
         return
+
     await message.answer(
-        "🛠 <b>Админ-панель</b>\n"
-        f"Прогнозы: {'🟢 открыты' if predictions_open() else '🔴 закрыты'}\n\n"
-        "/open — открыть\n"
-        "/close — закрыть\n"
-        "/status — проверить статус",
-        parse_mode="HTML"
+        admin_matches_text(),
+        parse_mode="HTML",
+        reply_markup=admin_matches_keyboard()
     )
-    await send_admin_next(message)
 
 
 @dp.message(Command("undoresult"))
@@ -578,6 +659,57 @@ async def user_leaderboard(call: CallbackQuery):
     await call.message.answer(leaderboard_text(), parse_mode="HTML")
 
 
+
+@dp.callback_query(F.data == "admin:matches")
+async def admin_matches(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await call.answer()
+    await call.message.answer(
+        admin_matches_text(),
+        parse_mode="HTML",
+        reply_markup=admin_matches_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "admin:leaderboard")
+async def admin_leaderboard(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await call.answer()
+    await call.message.answer(leaderboard_text(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adminmatch:"))
+async def admin_choose_match(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+
+    _, mid = call.data.split(":", 1)
+
+    if get_actual(mid):
+        await call.answer("Этот результат уже внесён.")
+        return
+
+    a, b = resolved_actual_match(mid)
+    if not a or not b:
+        await call.answer("Этот матч ещё не сформирован.", show_alert=True)
+        return
+
+    m = MATCHES[mid]
+    await call.answer()
+    await call.message.answer(
+        f"🛠 <b>{mid}</b> · {m.title}\n\n"
+        f"{esc(a)} ⚔️ {esc(b)}\n\n"
+        "Кто реально победил?",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(mid, a, b)
+    )
+
+
 @dp.callback_query(F.data.startswith("actual:"))
 async def actual_result(call: CallbackQuery, bot: Bot):
     if call.from_user.id not in ADMIN_IDS:
@@ -608,7 +740,15 @@ async def actual_result(call: CallbackQuery, bot: Bot):
         parse_mode="HTML"
     )
     await notify_all(bot, mid, winner)
-    await send_admin_next(call.message)
+
+    if mid == "GF":
+        await notify_winners(bot)
+
+    await call.message.answer(
+        admin_matches_text(),
+        parse_mode="HTML",
+        reply_markup=admin_matches_keyboard()
+    )
 
 
 async def main():
