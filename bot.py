@@ -1,13 +1,15 @@
 import asyncio
 import os
+from io import BytesIO
 from dataclasses import dataclass
 from typing import Optional
 
 import psycopg
 from psycopg.rows import tuple_row
+from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -486,6 +488,213 @@ async def notify_winners(bot: Bot):
         except Exception:
             pass
 
+
+def _font(size: int, bold: bool = False):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
+
+
+def _prediction_status(user_id: int, mid: str):
+    pred = get_pick(user_id, mid)
+    actual = get_actual(mid)
+
+    if not pred:
+        return "empty", None, None
+
+    predicted_winner = pred[0]
+
+    if not actual:
+        return "pending", predicted_winner, None
+
+    actual_winner = actual[0]
+    if predicted_winner == actual_winner:
+        if mid == "GF":
+            return "champion", predicted_winner, actual_winner
+        return "correct", predicted_winner, actual_winner
+
+    return "wrong", predicted_winner, actual_winner
+
+
+def render_bracket_png(user_id: int, display_name: str) -> bytes:
+    W, H = 1800, 1180
+    BG = (19, 22, 28)
+    PANEL = (34, 39, 48)
+    BORDER = (72, 80, 94)
+    TEXT = (238, 242, 247)
+    MUTED = (160, 170, 184)
+    GREEN = (44, 180, 105)
+    RED = (225, 75, 75)
+    GRAY = (96, 105, 120)
+    GOLD = (230, 181, 55)
+
+    image = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(image)
+
+    title_font = _font(44, True)
+    subtitle_font = _font(27, False)
+    section_font = _font(28, True)
+    match_font = _font(22, True)
+    small_font = _font(18, False)
+    score_font = _font(25, True)
+
+    correct, completed, _ = score(user_id)
+    total = len(ORDER)
+    accuracy = round(correct / completed * 100) if completed else 0
+
+    draw.text((60, 42), "THE INTERNATIONAL 2026 - MY PREDICTION", font=title_font, fill=TEXT)
+    draw.text((60, 100), display_name, font=subtitle_font, fill=MUTED)
+    draw.text(
+        (60, 145),
+        f"Score: {correct}/{completed} played   |   Accuracy: {accuracy}%   |   Total matches: {total}",
+        font=score_font,
+        fill=TEXT
+    )
+
+    # Legend
+    legend = [
+        ("CORRECT", GREEN),
+        ("WRONG", RED),
+        ("NOT PLAYED", GRAY),
+        ("CHAMPION CORRECT", GOLD),
+    ]
+    lx = 60
+    for label, color in legend:
+        draw.rounded_rectangle((lx, 202, lx + 28, 230), radius=6, fill=color)
+        draw.text((lx + 38, 202), label, font=small_font, fill=MUTED)
+        lx += 260 if label != "CHAMPION CORRECT" else 330
+
+    box_w, box_h = 270, 86
+
+    # Visual positions approximate a double-elimination bracket.
+    positions = {
+        "UB1": (60, 310), "UB2": (60, 420), "UB3": (60, 530), "UB4": (60, 640),
+        "UB5": (390, 365), "UB6": (390, 585),
+        "UB7": (720, 475),
+        "GF":  (1430, 475),
+
+        "LB1": (390, 800), "LB2": (390, 910),
+        "LB3": (720, 800), "LB4": (720, 910),
+        "LB5": (1035, 855),
+        "LB6": (1240, 690),
+    }
+
+    # Connector topology for display.
+    edges = [
+        ("UB1","UB5"), ("UB2","UB5"), ("UB3","UB6"), ("UB4","UB6"),
+        ("UB5","UB7"), ("UB6","UB7"), ("UB7","GF"),
+        ("LB1","LB3"), ("LB2","LB4"), ("LB3","LB5"), ("LB4","LB5"),
+        ("LB5","LB6"), ("LB6","GF"),
+    ]
+
+    # Draw connections behind boxes.
+    for a_mid, b_mid in edges:
+        if a_mid not in positions or b_mid not in positions:
+            continue
+        ax, ay = positions[a_mid]
+        bx, by = positions[b_mid]
+        x1, y1 = ax + box_w, ay + box_h // 2
+        x2, y2 = bx, by + box_h // 2
+        midx = (x1 + x2) // 2
+        draw.line((x1, y1, midx, y1), fill=BORDER, width=4)
+        draw.line((midx, y1, midx, y2), fill=BORDER, width=4)
+        draw.line((midx, y2, x2, y2), fill=BORDER, width=4)
+
+    draw.text((60, 260), "UPPER BRACKET", font=section_font, fill=TEXT)
+    draw.text((60, 755), "LOWER BRACKET", font=section_font, fill=TEXT)
+
+    def truncate(s, n=22):
+        return s if len(s) <= n else s[:n-1] + "…"
+
+    for mid, (x, y) in positions.items():
+        m = MATCHES[mid]
+        a, b = resolved_user_match(user_id, mid)
+        status, pred_winner, actual_winner = _prediction_status(user_id, mid)
+
+        color = {
+            "correct": GREEN,
+            "wrong": RED,
+            "pending": GRAY,
+            "empty": BORDER,
+            "champion": GOLD,
+        }[status]
+
+        draw.rounded_rectangle(
+            (x, y, x + box_w, y + box_h),
+            radius=14,
+            fill=PANEL,
+            outline=color,
+            width=5
+        )
+
+        draw.text((x + 14, y + 10), mid, font=match_font, fill=color)
+
+        if a and b:
+            draw.text((x + 68, y + 11), f"{truncate(a, 16)} vs {truncate(b, 16)}",
+                      font=small_font, fill=TEXT)
+        else:
+            draw.text((x + 68, y + 11), "waiting for previous matches",
+                      font=small_font, fill=MUTED)
+
+        if pred_winner:
+            draw.text((x + 14, y + 46), f"Pick: {truncate(pred_winner)}",
+                      font=small_font, fill=TEXT)
+
+        if actual_winner:
+            result_label = "Correct" if status in ("correct", "champion") else f"Actual: {truncate(actual_winner)}"
+            draw.text((x + 145, y + 46), result_label,
+                      font=small_font, fill=color)
+        elif pred_winner:
+            draw.text((x + 175, y + 46), "Pending",
+                      font=small_font, fill=MUTED)
+
+    champ_pick = get_pick(user_id, "GF")
+    if champ_pick:
+        champ = champ_pick[0]
+        actual_gf = get_actual("GF")
+        champ_status = "pending"
+        champ_color = GRAY
+        if actual_gf:
+            if champ == actual_gf[0]:
+                champ_status = "CORRECT"
+                champ_color = GOLD
+            else:
+                champ_status = "WRONG"
+                champ_color = RED
+
+        draw.rounded_rectangle((1320, 1020, 1740, 1120), radius=18, fill=PANEL, outline=champ_color, width=5)
+        draw.text((1345, 1038), "PREDICTED CHAMPION", font=small_font, fill=MUTED)
+        draw.text((1345, 1068), truncate(champ, 25), font=section_font, fill=champ_color)
+        draw.text((1620, 1040), champ_status, font=small_font, fill=champ_color)
+
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+async def send_bracket_image(message: Message, user):
+    if not prediction_complete(user.id):
+        await message.answer(
+            "Сетка появится после того, как ты полностью закончишь прогноз."
+        )
+        return
+
+    name = f"@{user.username}" if user.username else (user.first_name or str(user.id))
+    png = render_bracket_png(user.id, name)
+    photo = BufferedInputFile(png, filename=f"ti2026_bracket_{user.id}.png")
+    await message.answer_photo(
+        photo,
+        caption="🗺 <b>Твоя сетка TI 2026</b>\n"
+                "Зелёный — угадано, красный — ошибка, серый — матч ещё не сыгран, "
+                "золотой — правильно угаданный чемпион.",
+        parse_mode="HTML"
+    )
+
 dp = Dispatcher()
 
 
@@ -497,10 +706,15 @@ async def start(message: Message):
         await message.answer(
             closed_text(),
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🎯 Мой счёт", callback_data="user:score"),
-                InlineKeyboardButton(text="🏆 Общий счёт", callback_data="user:leaderboard")
-            ]])
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🎯 Мой счёт", callback_data="user:score"),
+                    InlineKeyboardButton(text="🏆 Общий счёт", callback_data="user:leaderboard")
+                ],
+                [
+                    InlineKeyboardButton(text="🗺 Моя сетка", callback_data="user:bracket")
+                ]
+            ])
         )
         return
 
@@ -509,6 +723,9 @@ async def start(message: Message):
         [
             InlineKeyboardButton(text="🎯 Мой счёт", callback_data="user:score"),
             InlineKeyboardButton(text="🏆 Общий счёт", callback_data="user:leaderboard"),
+        ],
+        [
+            InlineKeyboardButton(text="🗺 Моя сетка", callback_data="user:bracket")
         ]
     ])
     await message.answer(
@@ -519,6 +736,13 @@ async def start(message: Message):
         parse_mode="HTML",
         reply_markup=kb
     )
+
+
+
+@dp.message(Command("bracket"))
+async def bracket_cmd(message: Message):
+    register_user(message.from_user)
+    await send_bracket_image(message, message.from_user)
 
 
 @dp.message(Command("score"))
@@ -650,6 +874,14 @@ async def user_score(call: CallbackQuery):
     register_user(call.from_user)
     await call.answer()
     await call.message.answer(score_text(call.from_user.id), parse_mode="HTML")
+
+
+
+@dp.callback_query(F.data == "user:bracket")
+async def user_bracket(call: CallbackQuery):
+    register_user(call.from_user)
+    await call.answer()
+    await send_bracket_image(call.message, call.from_user)
 
 
 @dp.callback_query(F.data == "user:leaderboard")
