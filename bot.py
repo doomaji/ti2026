@@ -450,43 +450,134 @@ def admin_matches_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def notify_winners(bot: Bot):
+def final_standings():
+    """Return completed participants grouped by score with shared place ranges."""
     with conn() as c:
         with c.cursor() as cur:
             cur.execute("SELECT user_id, username, first_name FROM users")
             users = cur.fetchall()
 
-    results = []
+    participants = []
     for uid, username, first_name in users:
         if not prediction_complete(uid):
             continue
-        correct, completed, _ = score(uid)
-        results.append((uid, correct, completed))
 
-    if not results:
+        correct, completed, _ = score(uid)
+        name = f"@{username}" if username else (first_name or str(uid))
+        participants.append({
+            "uid": uid,
+            "name": name,
+            "correct": correct,
+            "completed": completed,
+        })
+
+    participants.sort(key=lambda row: (-row["correct"], row["name"].lower()))
+
+    groups = []
+    offset = 0
+
+    while offset < len(participants):
+        score_value = participants[offset]["correct"]
+        same_score = []
+
+        while offset < len(participants) and participants[offset]["correct"] == score_value:
+            same_score.append(participants[offset])
+            offset += 1
+
+        previous_count = sum(len(g["participants"]) for g in groups)
+        start_place = previous_count + 1
+        end_place = start_place + len(same_score) - 1
+
+        groups.append({
+            "score": score_value,
+            "completed": same_score[0]["completed"],
+            "start": start_place,
+            "end": end_place,
+            "participants": same_score,
+        })
+
+    return groups
+
+
+def place_range_text(start: int, end: int) -> str:
+    return str(start) if start == end else f"{start}–{end}"
+
+
+def final_results_text() -> str:
+    groups = final_standings()
+
+    if not groups:
+        return "🏆 <b>ИТОГИ TI 2026 PICK'EM</b>\\n\\nНет завершённых прогнозов."
+
+    out = ["🏆 <b>ИТОГИ TI 2026 PICK'EM</b>"]
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    for group_index, group in enumerate(groups):
+        place_text = place_range_text(group["start"], group["end"])
+        medal = medals[group_index] if group_index < len(medals) else "🏅"
+
+        out.append(
+            f"\\n{medal} <b>{place_text} место</b> — "
+            f"<b>{group['score']}/{group['completed']}</b>"
+        )
+
+        for participant in group["participants"]:
+            out.append(f"• {esc(participant['name'])}")
+
+    return "\\n".join(out)
+
+
+async def notify_final_places(bot: Bot):
+    """Send every completed participant their final place range and reward."""
+    groups = final_standings()
+
+    if not groups:
         return
 
-    best_score = max(correct for _, correct, _ in results)
-    winners = [(uid, completed) for uid, correct, completed in results if correct == best_score]
+    for group in groups:
+        place_text = place_range_text(group["start"], group["end"])
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🎁 ЗАБРАТЬ АРКАНУ", url=RICKROLL_URL)
-    ]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎁 ПОЛУЧИТЬ НАГРАДУ",
+                    url=RICKROLL_URL
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏆 ИТОГИ",
+                    callback_data="user:finalresults"
+                )
+            ]
+        ])
 
-    for uid, completed in winners:
-        try:
-            await bot.send_message(
-                uid,
-                "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\n"
-                "Вы самый лучший прогнозёр The International!\n"
-                f"Ваш результат: <b>{best_score}/{completed}</b>\n\n"
-                "🎁 Вы выиграли <b>Аркану</b>!\n"
-                "Нажмите кнопку ниже, чтобы получить приз:",
-                parse_mode="HTML",
-                reply_markup=kb
+        for participant in group["participants"]:
+            if group["start"] == group["end"]:
+                place_line = f"Вы заняли <b>{place_text} место</b>!"
+            else:
+                place_line = f"Вы разделили <b>{place_text} место</b>!"
+
+            message_text = (
+                "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\\n\\n"
+                "The International 2026 Pick'Em завершён!\\n\\n"
+                f"🏅 {place_line}\\n"
+                f"🎯 Ваш итоговый результат: "
+                f"<b>{participant['correct']}/{participant['completed']}</b>\\n\\n"
+                "🎁 <b>Вы получили награду!</b>\\n"
+                "Нажмите кнопку ниже, чтобы получить её:"
             )
-        except Exception:
-            pass
+
+            try:
+                await bot.send_message(
+                    participant["uid"],
+                    message_text,
+                    parse_mode="HTML",
+                    reply_markup=kb
+                )
+            except Exception:
+                pass
 
 
 def _font(size: int, bold: bool = False):
@@ -739,6 +830,17 @@ async def start(message: Message):
 
 
 
+@dp.message(Command("results"))
+async def results_cmd(message: Message):
+    if not get_actual("GF"):
+        await message.answer(
+            "⏳ Итоговая таблица появится после внесения результата Grand Final."
+        )
+        return
+
+    await message.answer(final_results_text(), parse_mode="HTML")
+
+
 @dp.message(Command("bracket"))
 async def bracket_cmd(message: Message):
     register_user(message.from_user)
@@ -884,6 +986,19 @@ async def user_bracket(call: CallbackQuery):
     await send_bracket_image(call.message, call.from_user)
 
 
+@dp.callback_query(F.data == "user:finalresults")
+async def user_final_results(call: CallbackQuery):
+    await call.answer()
+
+    if not get_actual("GF"):
+        await call.message.answer(
+            "⏳ Итоговая таблица появится после внесения результата Grand Final."
+        )
+        return
+
+    await call.message.answer(final_results_text(), parse_mode="HTML")
+
+
 @dp.callback_query(F.data == "user:leaderboard")
 async def user_leaderboard(call: CallbackQuery):
     await call.answer()
@@ -973,7 +1088,7 @@ async def actual_result(call: CallbackQuery, bot: Bot):
     await notify_all(bot, mid, winner)
 
     if mid == "GF":
-        await notify_winners(bot)
+        await notify_final_places(bot)
 
     await call.message.answer(
         admin_matches_text(),
